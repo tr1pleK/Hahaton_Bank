@@ -246,3 +246,91 @@ class CSVTransactionPredictionResponse(BaseModel):
     Balance: Optional[float] = None
     Category: str
     Probability: float = Field(..., ge=0.0, le=1.0)
+
+
+class TransactionFrontendDto(BaseModel):
+    """Схема для входных данных с фронтенда"""
+    date: str = Field(..., description="Дата транзакции (поддержка разных форматов)")
+    isIncome: bool = Field(..., description="True - пополнение (deposit), False - снятие (withdrawal)")
+    value: float = Field(..., gt=0, description="Сумма транзакции")
+    
+    @field_validator('date', mode='before')
+    @classmethod
+    def validate_date(cls, v):
+        """Валидация даты с поддержкой разных форматов"""
+        if v is None:
+            raise ValueError("Поле 'date' обязательно для заполнения")
+        
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                raise ValueError("Поле 'date' не может быть пустым")
+            
+            # Пробуем разные форматы дат
+            date_formats = [
+                '%Y-%m-%d',      # 2023-01-15
+                '%d.%m.%Y',      # 15.01.2023
+                '%d/%m/%Y',      # 15/01/2023
+                '%Y/%m/%d',      # 2023/01/15
+                '%d-%m-%Y',      # 15-01-2023
+                '%m/%d/%Y',      # 01/15/2023 (US format)
+                '%d.%m.%y',      # 15.01.23
+                '%d/%m/%y',      # 15/01/23
+            ]
+            
+            parsed_date = None
+            for fmt in date_formats:
+                try:
+                    parsed_date = datetime.strptime(v, fmt).date()
+                    break
+                except ValueError:
+                    continue
+            
+            if parsed_date is None:
+                raise ValueError(
+                    f"Неверный формат даты: '{v}'. "
+                    f"Используйте один из форматов: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY, DD-MM-YYYY, MM/DD/YYYY"
+                )
+            
+            # Проверка на разумность даты
+            today = date.today()
+            max_future_date = today + timedelta(days=365)
+            if parsed_date > max_future_date:
+                raise ValueError(
+                    f"Дата не может быть более чем на 1 год в будущем. "
+                    f"Получено: {parsed_date.strftime('%Y-%m-%d')}"
+                )
+            
+            min_date = today - timedelta(days=3650)  # 10 лет назад
+            if parsed_date < min_date:
+                raise ValueError(
+                    f"Дата слишком старая. Минимальная дата: {min_date.strftime('%Y-%m-%d')}"
+                )
+            
+            return parsed_date.strftime('%Y-%m-%d')
+        
+        return str(v)
+
+
+class TransactionPredictDto(BaseModel):
+    """Схема для отправки в ML модель (формат: Date, Category, Ref_num, date, Withdrawal, Deposit, Balance)"""
+    Date: str
+    Category: Optional[str] = None  # Будет заполнено после предсказания
+    Ref_num: Optional[str] = None
+    date: str  # Дублирование Date для совместимости с моделью
+    Withdrawal: float = Field(0.0, ge=0)
+    Deposit: float = Field(0.0, ge=0)
+    Balance: float = Field(0.0, ge=0)
+
+
+class TransactionDataBaseDto(BaseModel):
+    """Схема для ответа на фронтенд и сохранения в БД"""
+    id: Optional[int] = None
+    user_id: Optional[int] = None
+    date: str
+    amount: float
+    description: Optional[str] = None
+    category: str
+    category_probability: float = Field(..., ge=0.0, le=1.0, description="Вероятность предсказанной категории")
+    is_income: bool
+    created_at: Optional[str] = None
