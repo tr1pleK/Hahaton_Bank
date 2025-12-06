@@ -1,5 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.exc import OperationalError
 from app.api.analytics import router as analytics_router
@@ -241,6 +243,48 @@ async def root():
 async def health_check():
     """Проверка здоровья приложения"""
     return {"status": "healthy"}
+
+
+# Глобальный обработчик ошибок валидации
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Обработчик ошибок валидации данных
+    Возвращает понятные сообщения об ошибках для фронтенда
+    """
+    errors = []
+    for error in exc.errors():
+        # Формируем путь к полю
+        field_path = " -> ".join(str(loc) for loc in error["loc"])
+        
+        # Получаем сообщение об ошибке
+        message = error.get("msg", "Ошибка валидации")
+        
+        # Улучшаем сообщения для числовых полей
+        if "value is not a valid" in message.lower() and "float" in message.lower():
+            message = f"Поле '{field_path}' должно быть числом. Получено некорректное значение."
+        elif "value is not a valid" in message.lower():
+            message = f"Поле '{field_path}' имеет некорректный формат."
+        elif "не может быть отрицательным" in message.lower() or "greater than or equal to" in message.lower():
+            # Сообщение уже хорошее, оставляем как есть или улучшаем
+            if "greater than or equal to" in message.lower():
+                message = f"Поле '{field_path}' не может быть отрицательным. Укажите положительное число или ноль."
+        
+        errors.append({
+            "field": field_path,
+            "message": message,
+            "type": error.get("type", "validation_error"),
+            "input": error.get("input")
+        })
+    
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": errors,
+            "error": "Ошибка валидации данных",
+            "message": "Проверьте правильность введенных данных. Все числовые поля (Withdrawal, Deposit, Balance) должны содержать числа."
+        }
+    )
 
 
 # Подключаем роутеры

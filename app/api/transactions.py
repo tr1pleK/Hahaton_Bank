@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any, List
 from datetime import date
 import pandas as pd
+from pydantic import ValidationError
 
 from app.database import get_db
 from app.models.user import User
@@ -60,6 +61,43 @@ async def get_transactions_endpoint(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """Получить список транзакций"""
+    # Валидация диапазона дат
+    if start_date and end_date:
+        if start_date > end_date:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"start_date не может быть позже end_date. "
+                    f"Получено: start_date={start_date}, end_date={end_date}"
+                )
+            )
+        
+        # Проверка на слишком большой диапазон (больше 5 лет)
+        delta = end_date - start_date
+        max_days = 1825  # 5 лет
+        if delta.days > max_days:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Диапазон дат слишком большой. Максимум: {max_days // 365} лет "
+                    f"({max_days} дней). Получено: {delta.days} дней"
+                )
+            )
+    
+    # Валидация отдельных дат
+    today = date.today()
+    if start_date and start_date > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"start_date не может быть в будущем. Получено: {start_date}, сегодня: {today}"
+        )
+    
+    if end_date and end_date > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"end_date не может быть в будущем. Получено: {end_date}, сегодня: {today}"
+        )
+    
     category_enum = None
     if category:
         try:
@@ -186,6 +224,25 @@ async def predict_category_endpoint(
         return results
     except HTTPException:
         raise
+    except ValidationError as e:
+        # Обработка ошибок валидации Pydantic
+        errors = []
+        for error in e.errors():
+            field = " -> ".join(str(loc) for loc in error["loc"])
+            message = error["msg"]
+            errors.append({
+                "field": field,
+                "message": message,
+                "type": error.get("type", "validation_error")
+            })
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "Ошибка валидации данных",
+                "errors": errors,
+                "message": "Проверьте правильность введенных данных. Все числовые поля должны содержать числа."
+            }
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
