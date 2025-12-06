@@ -37,7 +37,7 @@ services:
       - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - .:/app
-      - ml_models:/app/ml_models
+      - ./ml_models:/app/ml_models
     depends_on:
       db:
         condition: service_healthy
@@ -47,7 +47,6 @@ services:
 
 volumes:
   postgres_data:
-  ml_models:
 
 networks:
   finance_network:

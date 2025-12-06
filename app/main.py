@@ -1,7 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.exc import OperationalError
+from app.api.analytics import router as analytics_router
 import time
 import sys
 import traceback
@@ -174,9 +177,48 @@ async def lifespan(app: FastAPI):
 # Создаем приложение FastAPI
 app = FastAPI(
     title=settings.APP_NAME,
+    description="API для анализа финансовых транзакций с ML классификацией",
+    version="1.0.0",
     debug=settings.DEBUG,
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
+
+# Настройка OpenAPI схемы для Bearer token
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    from fastapi.openapi.utils import get_openapi
+    
+    openapi_schema = get_openapi(
+        title=settings.APP_NAME,
+        version="1.0.0",
+        description="API для анализа финансовых транзакций с ML классификацией",
+        routes=app.routes,
+    )
+    
+    # HTTPBearer автоматически создаст Bearer схему, но мы можем улучшить описание
+    if "components" not in openapi_schema:
+        openapi_schema["components"] = {}
+    if "securitySchemes" not in openapi_schema["components"]:
+        openapi_schema["components"]["securitySchemes"] = {}
+    
+    # Убеждаемся, что Bearer схема настроена правильно
+    openapi_schema["components"]["securitySchemes"]["Bearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Введите Bearer token, полученный при авторизации через /auth/login. Просто вставьте токен без слова 'Bearer'"
+    }
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+# Переопределяем openapi для улучшения Bearer token схемы
+app.openapi = custom_openapi
 
 # Настройка CORS
 app.add_middleware(
@@ -203,6 +245,48 @@ async def health_check():
     return {"status": "healthy"}
 
 
+# Глобальный обработчик ошибок валидации
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Обработчик ошибок валидации данных
+    Возвращает понятные сообщения об ошибках для фронтенда
+    """
+    errors = []
+    for error in exc.errors():
+        # Формируем путь к полю
+        field_path = " -> ".join(str(loc) for loc in error["loc"])
+        
+        # Получаем сообщение об ошибке
+        message = error.get("msg", "Ошибка валидации")
+        
+        # Улучшаем сообщения для числовых полей
+        if "value is not a valid" in message.lower() and "float" in message.lower():
+            message = f"Поле '{field_path}' должно быть числом. Получено некорректное значение."
+        elif "value is not a valid" in message.lower():
+            message = f"Поле '{field_path}' имеет некорректный формат."
+        elif "не может быть отрицательным" in message.lower() or "greater than or equal to" in message.lower():
+            # Сообщение уже хорошее, оставляем как есть или улучшаем
+            if "greater than or equal to" in message.lower():
+                message = f"Поле '{field_path}' не может быть отрицательным. Укажите положительное число или ноль."
+        
+        errors.append({
+            "field": field_path,
+            "message": message,
+            "type": error.get("type", "validation_error"),
+            "input": error.get("input")
+        })
+    
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "detail": errors,
+            "error": "Ошибка валидации данных",
+            "message": "Проверьте правильность введенных данных. Все числовые поля (Withdrawal, Deposit, Balance) должны содержать числа."
+        }
+    )
+
+
 # Подключаем роутеры
 print("🔌 Подключение роутеров...")
 try:
@@ -219,6 +303,16 @@ try:
     print("  ✅ transactions.router подключен")
 except Exception as e:
     print(f"  ❌ Ошибка подключения transactions.router: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    traceback.print_exc()
+    raise
+
+try:
+    print("  → Подключение analytics_router")
+    app.include_router(analytics_router)
+    print("  ✅ analytics_router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения analytics_router: {e}")
     print(f"  Тип ошибки: {type(e).__name__}")
     traceback.print_exc()
     raise

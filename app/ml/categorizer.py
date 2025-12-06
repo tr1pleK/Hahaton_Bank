@@ -1,23 +1,56 @@
-"""Простой категоризатор транзакций"""
+"""Категоризатор транзакций с использованием ML модели"""
+from typing import Optional
+from datetime import datetime
+import pandas as pd
 from app.models.category import TransactionCategory
+from app.ml.transaction_classifier import TransactionClassifier
+
+# Глобальный экземпляр классификатора (загружается один раз)
+_classifier: Optional[TransactionClassifier] = None
 
 
-def categorize_transaction(description: str, amount: float) -> TransactionCategory:
-    """Определяет категорию транзакции"""
-    desc_lower = (description or "").lower()
+def _get_classifier() -> TransactionClassifier:
+    """Получить или создать экземпляр классификатора"""
+    global _classifier
+    if _classifier is None:
+        _classifier = TransactionClassifier()
+    return _classifier
+
+
+def categorize_transaction(
+    description: str, 
+    amount: float, 
+    is_expense: bool = True,
+    date: Optional[datetime] = None
+) -> TransactionCategory:
+    """
+    Определяет категорию транзакции с использованием ML модели
     
-    # Ключевые слова
-    if any(word in desc_lower for word in ["продукты", "магазин", "еда"]):
-        return TransactionCategory.PRODUCTS
-    if any(word in desc_lower for word in ["транспорт", "метро", "такси"]):
-        return TransactionCategory.TRANSPORT
-    if any(word in desc_lower for word in ["кафе", "ресторан", "кофе"]):
-        return TransactionCategory.CAFE
-    if any(word in desc_lower for word in ["здоровье", "врач", "лекарство"]):
-        return TransactionCategory.HEALTH
+    Args:
+        description: Описание транзакции (RefNo)
+        amount: Сумма транзакции
+        is_expense: Является ли транзакция расходом
+        date: Дата транзакции
+        
+    Returns:
+        Категория транзакции
+    """
+    classifier = _get_classifier()
     
-    # Большие суммы - возможно доход
-    if amount > 10000:
-        return TransactionCategory.SALARY
+    # Создаем DataFrame для предсказания (как в test_classifier.py)
+    if date is None:
+        date = datetime.now()
     
-    return TransactionCategory.OTHER_EXPENSE
+    withdrawal = amount if is_expense else 0.0
+    deposit = amount if not is_expense else 0.0
+    
+    df = pd.DataFrame([{
+        'Date': date,
+        'RefNo': description or '',
+        'Withdrawal': withdrawal,
+        'Deposit': deposit,
+        'Balance': 0.0  # Баланс неизвестен для одной транзакции
+    }])
+    
+    category, probability = classifier.predict_from_dataframe(df)
+    return category

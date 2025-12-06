@@ -1,18 +1,24 @@
 """API endpoints для транзакций"""
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import date
+import pandas as pd
+from pydantic import ValidationError
 
 from app.database import get_db
 from app.models.user import User
 from app.models.category import TransactionCategory
 from app.dependencies import get_current_user
-from app.schemas.transaction import TransactionCreate, TransactionUpdate
+from app.schemas.transaction import (
+    TransactionCreate, TransactionUpdate,
+    CSVTransactionInput, CSVTransactionPredictionResponse
+)
 from app.services.transaction_service import (
     create_transaction, get_transaction, get_transactions,
     update_transaction, delete_transaction
 )
+from app.ml.transaction_classifier import TransactionClassifier
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -55,6 +61,43 @@ async def get_transactions_endpoint(
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
     """Получить список транзакций"""
+    # Валидация диапазона дат
+    if start_date and end_date:
+        if start_date > end_date:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"start_date не может быть позже end_date. "
+                    f"Получено: start_date={start_date}, end_date={end_date}"
+                )
+            )
+        
+        # Проверка на слишком большой диапазон (больше 5 лет)
+        delta = end_date - start_date
+        max_days = 1825  # 5 лет
+        if delta.days > max_days:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Диапазон дат слишком большой. Максимум: {max_days // 365} лет "
+                    f"({max_days} дней). Получено: {delta.days} дней"
+                )
+            )
+    
+    # Валидация отдельных дат
+    today = date.today()
+    if start_date and start_date > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"start_date не может быть в будущем. Получено: {start_date}, сегодня: {today}"
+        )
+    
+    if end_date and end_date > today:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"end_date не может быть в будущем. Получено: {end_date}, сегодня: {today}"
+        )
+    
     category_enum = None
     if category:
         try:
@@ -114,3 +157,94 @@ async def delete_transaction_endpoint(
     if not delete_transaction(db, transaction_id, current_user.id):
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
     return None
+
+
+@router.post("/predict-category", response_model=List[CSVTransactionPredictionResponse])
+async def predict_category_endpoint(
+    transactions: List[CSVTransactionInput],
+    current_user: User = Depends(get_current_user)
+) -> List[CSVTransactionPredictionResponse]:
+    """
+    Предсказание категорий для массива транзакций с использованием ML модели
+    
+    Принимает массив транзакций в формате CSV (Date, RefNo, Withdrawal, Deposit, Balance)
+    и возвращает массив с предсказанными категориями и вероятностями.
+    
+    Args:
+        transactions: Массив транзакций для классификации (минимум 1 элемент)
+        
+    Returns:
+        Массив транзакций с добавленными полями Category и Probability
+    """
+    try:
+        if not transactions or len(transactions) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Массив транзакций не может быть пустым"
+            )
+        
+        # Инициализация классификатора
+        classifier = TransactionClassifier()
+        
+        if not classifier.is_trained:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Модель не загружена. Убедитесь, что файл classifier_v2.pkl существует в app/ml/"
+            )
+        
+        # Результаты предсказаний
+        results = []
+        
+        # Обрабатываем каждую транзакцию
+        for transaction in transactions:
+            # Преобразование данных в DataFrame (как в test_classifier.py)
+            df = pd.DataFrame([{
+                'Date': transaction.Date,
+                'RefNo': transaction.RefNo or '',
+                'Withdrawal': transaction.Withdrawal if transaction.Withdrawal else 0.0,
+                'Deposit': transaction.Deposit if transaction.Deposit else 0.0,
+                'Balance': transaction.Balance if transaction.Balance else 0.0
+            }])
+            
+            # Применение логики из test_classifier.py
+            category, probability = classifier.predict_from_dataframe(df)
+            
+            # Формирование ответа
+            result = CSVTransactionPredictionResponse(
+                Date=transaction.Date,
+                RefNo=transaction.RefNo,
+                Withdrawal=transaction.Withdrawal,
+                Deposit=transaction.Deposit,
+                Balance=transaction.Balance,
+                Category=category.value,
+                Probability=round(probability, 4)
+            )
+            results.append(result)
+        
+        return results
+    except HTTPException:
+        raise
+    except ValidationError as e:
+        # Обработка ошибок валидации Pydantic
+        errors = []
+        for error in e.errors():
+            field = " -> ".join(str(loc) for loc in error["loc"])
+            message = error["msg"]
+            errors.append({
+                "field": field,
+                "message": message,
+                "type": error.get("type", "validation_error")
+            })
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "Ошибка валидации данных",
+                "errors": errors,
+                "message": "Проверьте правильность введенных данных. Все числовые поля должны содержать числа."
+            }
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка при предсказании категории: {str(e)}"
+        )
