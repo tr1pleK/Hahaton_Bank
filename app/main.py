@@ -3,9 +3,80 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy.exc import OperationalError
 import time
+import sys
+import traceback
+
+# Увеличиваем лимит рекурсии для более детального traceback
+sys.setrecursionlimit(5000)
+
 from app.database import engine, Base, SessionLocal
 from app.config import settings
-from app.api import auth
+
+# Логирование импортов для отладки
+print("📦 Импорт модулей...")
+print(f"📦 Лимит рекурсии установлен: {sys.getrecursionlimit()}")
+
+try:
+    print("  → Импорт auth...")
+    from app.api import auth
+    print("  ✅ auth импортирован")
+except RecursionError as e:
+    print(f"  ❌ RecursionError при импорте auth!")
+    exc_lines = traceback.format_exc().split('\n')
+    print(f"  Глубина рекурсии: {len(exc_lines)}")
+    traceback.print_exc()
+    sys.exit(1)
+except Exception as e:
+    print(f"  ❌ Ошибка импорта auth: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    traceback.print_exc()
+    sys.exit(1)
+
+try:
+    print("  → Импорт transactions...")
+    print("    → Начало импорта модуля transactions...")
+    # Пробуем импортировать по частям для диагностики
+    try:
+        import app.api.transactions as transactions_module
+        print("    → Модуль импортирован, проверяем содержимое...")
+        print(f"    → Файл модуля: {getattr(transactions_module, '__file__', 'неизвестно')}")
+        
+        # Пробуем выполнить код модуля вручную
+        import importlib
+        importlib.reload(transactions_module)
+        
+        if hasattr(transactions_module, 'router'):
+            print(f"  ✅ router найден: {type(transactions_module.router)}")
+            transactions = transactions_module
+        else:
+            print(f"  ❌ router НЕ найден после reload!")
+            print(f"  Доступные атрибуты: {[a for a in dir(transactions_module) if not a.startswith('_')]}")
+            # Пробуем создать роутер вручную
+            print("  → Пробуем создать роутер вручную...")
+            from fastapi import APIRouter
+            transactions_module.router = APIRouter(prefix="/transactions", tags=["transactions"])
+            transactions = transactions_module
+            print("  ✅ Роутер создан вручную")
+    except Exception as import_error:
+        print(f"  ❌ Ошибка при импорте/проверке модуля: {import_error}")
+        print(f"  Тип ошибки: {type(import_error).__name__}")
+        traceback.print_exc()
+        raise
+    
+    print("  ✅ transactions импортирован")
+except RecursionError as e:
+    print(f"  ❌ RecursionError при импорте transactions!")
+    exc_lines = traceback.format_exc().split('\n')
+    print(f"  Глубина рекурсии: {len(exc_lines)}")
+    print("  Полный traceback:")
+    traceback.print_exc()
+    sys.exit(1)
+except Exception as e:
+    print(f"  ❌ Ошибка импорта transactions: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    print("  Полный traceback:")
+    traceback.print_exc()
+    sys.exit(1)
 
 
 # Функция для ожидания готовности БД
@@ -133,5 +204,22 @@ async def health_check():
 
 
 # Подключаем роутеры
-app.include_router(auth.router)
+print("🔌 Подключение роутеров...")
+try:
+    print("  → Подключение auth.router...")
+    app.include_router(auth.router)
+    print("  ✅ auth.router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения auth.router: {e}")
+    traceback.print_exc()
+
+try:
+    print("  → Подключение transactions.router...")
+    app.include_router(transactions.router)
+    print("  ✅ transactions.router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения transactions.router: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    traceback.print_exc()
+    raise
 
