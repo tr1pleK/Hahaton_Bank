@@ -174,9 +174,48 @@ async def lifespan(app: FastAPI):
 # Создаем приложение FastAPI
 app = FastAPI(
     title=settings.APP_NAME,
+    description="API для анализа финансовых транзакций с ML классификацией",
+    version="1.0.0",
     debug=settings.DEBUG,
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
 )
+
+# Настройка OpenAPI схемы для Bearer token
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    
+    from fastapi.openapi.utils import get_openapi
+    
+    openapi_schema = get_openapi(
+        title=settings.APP_NAME,
+        version="1.0.0",
+        description="API для анализа финансовых транзакций с ML классификацией",
+        routes=app.routes,
+    )
+    
+    # HTTPBearer автоматически создаст Bearer схему, но мы можем улучшить описание
+    if "components" not in openapi_schema:
+        openapi_schema["components"] = {}
+    if "securitySchemes" not in openapi_schema["components"]:
+        openapi_schema["components"]["securitySchemes"] = {}
+    
+    # Убеждаемся, что Bearer схема настроена правильно
+    openapi_schema["components"]["securitySchemes"]["Bearer"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Введите Bearer token, полученный при авторизации через /auth/login. Просто вставьте токен без слова 'Bearer'"
+    }
+    
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+# Переопределяем openapi для улучшения Bearer token схемы
+app.openapi = custom_openapi
 
 # Настройка CORS
 app.add_middleware(
