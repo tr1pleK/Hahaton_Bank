@@ -4,6 +4,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.exc import OperationalError
+from sqlalchemy import text
 from app.api.analytics import router as analytics_router
 import time
 import sys
@@ -107,6 +108,43 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Запуск приложения...")
     
+    # Инициализация планировщика для дообучения модели
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    from app.services.model_retraining import retrain_model
+    from app.database import SessionLocal
+    
+    scheduler = AsyncIOScheduler()
+    
+    async def weekly_retraining():
+        """Еженедельное дообучение модели"""
+        print("🔄 Запуск еженедельного дообучения модели...")
+        db = SessionLocal()
+        try:
+            result = retrain_model(db, days_back=7)
+            if result["success"]:
+                print(f"✅ Дообучение завершено успешно. Новых транзакций: {result['new_transactions_count']}")
+            else:
+                print(f"⚠️ Дообучение не выполнено: {result['message']}")
+        except Exception as e:
+            print(f"❌ Ошибка при дообучении модели: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            db.close()
+    
+    # Планируем еженедельное дообучение (каждый понедельник в 3:00)
+    scheduler.add_job(
+        weekly_retraining,
+        trigger=CronTrigger(day_of_week='mon', hour=3, minute=0),
+        id='weekly_model_retraining',
+        name='Еженедельное дообучение модели',
+        replace_existing=True
+    )
+    
+    scheduler.start()
+    print("✅ Планировщик задач запущен. Дообучение модели запланировано на каждый понедельник в 3:00")
+    
     if not settings.SKIP_DB_CHECK:
         db_connected = wait_for_db()
         if db_connected:
@@ -156,6 +194,28 @@ async def lifespan(app: FastAPI):
                         db.commit()
                         print("✅ Демо-пользователь создан автоматически!")
                         print(f"   Email: {demo_email}, Пароль: demo123")
+                    
+                    # Выполняем SQL файл с транзакциями, если он существует
+                    import os
+                    from pathlib import Path
+                    sql_file = Path(__file__).parent.parent / "init_transactions.sql"
+                    if sql_file.exists():
+                        try:
+                            print("📝 Загрузка транзакций из init_transactions.sql...")
+                            sql_content = sql_file.read_text(encoding='utf-8')
+                            # Выполняем SQL через connection
+                            with engine.begin() as conn:
+                                # Разбиваем SQL на отдельные команды (DO блок должен выполняться целиком)
+                                conn.execute(text(sql_content))
+                            print("✅ Транзакции успешно загружены из SQL файла!")
+                        except Exception as sql_error:
+                            print(f"⚠️  Не удалось выполнить SQL файл: {sql_error}")
+                            import traceback
+                            traceback.print_exc()
+                            # Не критично, продолжаем работу
+                    else:
+                        print("ℹ️  SQL файл init_transactions.sql не найден, пропускаем загрузку транзакций")
+                        
                 except Exception as e:
                     db.rollback()
                     print(f"⚠️  Не удалось создать демо-пользователя: {e}")
@@ -170,8 +230,11 @@ async def lifespan(app: FastAPI):
         print("⏭️  Проверка БД пропущена (SKIP_DB_CHECK=True)")
     
     yield
+    
     # Shutdown
-    print("👋 Остановка приложения...")
+    print("🛑 Остановка приложения...")
+    scheduler.shutdown()
+    print("✅ Планировщик задач остановлен")
 
 
 # Создаем приложение FastAPI
@@ -313,6 +376,26 @@ try:
     print("  ✅ analytics_router подключен")
 except Exception as e:
     print(f"  ❌ Ошибка подключения analytics_router: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    traceback.print_exc()
+    raise
+
+try:
+    print("  → Подключение model_retraining.router...")
+    from app.api import model_retraining
+    app.include_router(model_retraining.router)
+    print("  ✅ model_retraining.router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения model_retraining.router: {e}")
+    traceback.print_exc()
+
+try:
+    print("  → Подключение forecast.router...")
+    from app.api import forecast
+    app.include_router(forecast.router)
+    print("  ✅ forecast.router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения forecast.router: {e}")
     print(f"  Тип ошибки: {type(e).__name__}")
     traceback.print_exc()
     raise

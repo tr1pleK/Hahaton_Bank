@@ -4,10 +4,12 @@ import pandas as pd
 import numpy as np
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 
 from app.models.category import TransactionCategory
+import lightgbm as lgb
+from sklearn.metrics import classification_report, f1_score
 
 # Маппинг категорий модели в категории системы
 CATEGORY_MAPPING = {
@@ -193,6 +195,152 @@ class TransactionClassifier:
         probability = float(y_proba_hybrid[0])
         
         return category, probability
+    
+    def train(self, df: pd.DataFrame, original_csv_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Обучение модели на DataFrame (логика из cybergarden_ML.py)
+        
+        Args:
+            df: DataFrame с колонками Date, Category, Withdrawal, Deposit, Balance
+            original_csv_path: Путь к оригинальному CSV файлу (опционально, для объединения данных)
+            
+        Returns:
+            Словарь с метриками обучения
+        """
+        print("🚀 Начало обучения модели...")
+        
+        # Если указан оригинальный CSV, объединяем данные
+        if original_csv_path and os.path.exists(original_csv_path):
+            print(f"📂 Загрузка оригинальных данных из {original_csv_path}...")
+            try:
+                df_original = pd.read_csv(original_csv_path, skiprows=5)
+                df_original.columns = ["Date1", "Category", "RefNo", "Date2", "Withdrawal", "Deposit", "Balance"]
+                df_original["Date"] = pd.to_datetime(df_original["Date2"], format="mixed", errors="coerce")
+                df_original = df_original[["Date", "Category", "Withdrawal", "Deposit", "Balance"]].copy()
+                df_original["Withdrawal"] = pd.to_numeric(df_original["Withdrawal"], errors="coerce").fillna(0)
+                df_original["Deposit"] = pd.to_numeric(df_original["Deposit"], errors="coerce").fillna(0)
+                df_original["Balance"] = pd.to_numeric(df_original["Balance"], errors="coerce").fillna(method="ffill")
+                
+                # Объединяем данные
+                df = pd.concat([df_original, df], ignore_index=True)
+                print(f"✅ Объединено данных: {len(df_original)} (оригинал) + {len(df) - len(df_original)} (новые) = {len(df)}")
+            except Exception as e:
+                print(f"⚠️ Не удалось загрузить оригинальный CSV: {e}. Используем только новые данные.")
+        
+        # Очистка данных (логика из cybergarden_ML.py)
+        df["Category"] = df["Category"].replace("Transport", "Misc")
+        valid_cats = ["Food", "Misc", "Rent", "Salary", "Shopping"]
+        df = df[df["Category"].isin(valid_cats)].copy().reset_index(drop=True)
+        
+        if len(df) == 0:
+            raise ValueError("Нет данных для обучения после фильтрации категорий")
+        
+        print(f"📊 Данных для обучения: {len(df)}")
+        print(f"📊 Распределение категорий:\n{df['Category'].value_counts()}")
+        
+        # Извлечение признаков
+        df_features = self.extract_features(df)
+        
+        # Подготовка X и y
+        feature_columns = [
+            "is_withdrawal", "is_deposit", "amount", "net_flow", "balance_before",
+            "day_of_month", "day_of_week", "is_month_start", "is_month_end",
+            "is_salary_like", "is_rent_like", "days_since_last_salary", "days_since_last_txn",
+            "Withdrawal", "Deposit"
+        ]
+        
+        X = df_features[feature_columns].fillna(-1)
+        y = df_features["Category"]
+        
+        # Разделение по времени: train до 70% данных, test — остальные 30%
+        split_idx = int(len(df_features) * 0.7)
+        train_idx = df_features.index[:split_idx]
+        test_idx = df_features.index[split_idx:]
+        
+        X_train = X.loc[train_idx]
+        y_train = y.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
+        
+        print(f"📊 Train size: {len(X_train)}, Test size: {len(X_test)}")
+        
+        # Обучение модели (логика из cybergarden_ML.py)
+        model = lgb.LGBMClassifier(
+            n_estimators=100,
+            num_leaves=15,
+            learning_rate=0.05,
+            min_data_in_leaf=10,
+            lambda_l1=0.1,
+            lambda_l2=0.1,
+            random_state=42,
+            class_weight="balanced"
+        )
+        
+        print("🎯 Обучение модели...")
+        model.fit(X_train, y_train)
+        
+        # Применение fallback правил
+        def apply_fallback_rules(X, y_pred, categories):
+            y_pred = y_pred.copy()
+            for i in range(len(X)):
+                row = X.iloc[i]
+                if row["is_salary_like"] == 1 and row["day_of_month"] in [24, 25, 26]:
+                    y_pred[i] = "Salary"
+                elif row["is_rent_like"] == 1:
+                    y_pred[i] = "Rent"
+                elif (
+                    row["Withdrawal"] >= 150 and
+                    row["Withdrawal"] <= 3000 and
+                    row["days_since_last_salary"] >= 0 and
+                    row["days_since_last_salary"] <= 5 and
+                    row["is_withdrawal"] == 1
+                ):
+                    y_pred[i] = "Shopping"
+            return y_pred
+        
+        y_pred = model.predict(X_test)
+        y_pred_hybrid = apply_fallback_rules(X_test, y_pred, model.classes_)
+        
+        # Оценка модели
+        f1_weighted = f1_score(y_test, y_pred_hybrid, average="weighted", zero_division=0)
+        f1_macro = f1_score(y_test, y_pred_hybrid, average="macro", zero_division=0)
+        
+        print("\n=== Метрики модели ===")
+        print(classification_report(y_test, y_pred_hybrid, zero_division=0))
+        print(f"F1 (weighted): {f1_weighted:.4f}")
+        print(f"F1 (macro): {f1_macro:.4f}")
+        
+        # Сохранение модели
+        self.model = model
+        self.save_model()
+        self.is_trained = True
+        
+        print(f"✅ Модель обучена и сохранена в: {self.model_path}")
+        
+        return {
+            "f1_weighted": float(f1_weighted),
+            "f1_macro": float(f1_macro),
+            "train_size": len(X_train),
+            "test_size": len(X_test),
+            "total_samples": len(df),
+            "categories": valid_cats
+        }
+    
+    def save_model(self):
+        """Сохранение модели в файл"""
+        if self.model is None:
+            print("❌ Нет модели для сохранения")
+            return
+        
+        try:
+            # Создаем директорию, если её нет
+            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+            joblib.dump(self.model, self.model_path)
+            print(f"✅ Модель сохранена в: {self.model_path}")
+        except Exception as e:
+            print(f"❌ Ошибка при сохранении модели: {e}")
+            import traceback
+            traceback.print_exc()
     
     def load_model(self):
         """Загрузка модели из файла"""
