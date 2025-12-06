@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from sqlalchemy.exc import OperationalError
+from app.api.analytics import router as analytics_router
 import time
 import sys
 import traceback
@@ -258,6 +259,16 @@ try:
     print("  ✅ transactions.router подключен")
 except Exception as e:
     print(f"  ❌ Ошибка подключения transactions.router: {e}")
+    print(f"  Тип ошибки: {type(e).__name__}")
+    traceback.print_exc()
+    raise
+
+try:
+    print("  → Подключение analytics_router")
+    app.include_router(analytics_router)
+    print("  ✅ analytics_router подключен")
+except Exception as e:
+    print(f"  ❌ Ошибка подключения analytics_router: {e}")
     print(f"  Тип ошибки: {type(e).__name__}")
     traceback.print_exc()
     raise
