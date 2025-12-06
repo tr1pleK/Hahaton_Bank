@@ -54,45 +54,11 @@ class TransactionUpdate(BaseModel):
     description: Optional[str] = None
     date: Optional[date] = None
     category: Optional[str] = None
-    
-    @field_validator('date', mode='before')
-    @classmethod
-    def validate_date(cls, v):
-        """Валидация даты транзакции (опциональное поле)"""
-        if v is None:
-            return None
-        
-        # Если строка, пытаемся преобразовать
-        if isinstance(v, str):
-            v = v.strip()
-            try:
-                v = datetime.strptime(v, '%Y-%m-%d').date()
-            except ValueError:
-                raise ValueError(
-                    "Неверный формат даты. Используйте формат: YYYY-MM-DD (например: 2023-01-15)"
-                )
-        
-        # Проверяем, что это объект date
-        if not isinstance(v, date):
-            raise ValueError("Поле 'date' должно быть датой")
-        
-        # Не разрешаем будущие даты
-        today = date.today()
-        if v > today:
-            raise ValueError(
-                f"Дата транзакции не может быть в будущем. Получено: {v.strftime('%Y-%m-%d')}, "
-                f"сегодня: {today.strftime('%Y-%m-%d')}"
-            )
-        
-        # Не разрешаем слишком старые даты (старше 10 лет)
-        min_date = today - timedelta(days=3650)  # 10 лет назад
-        if v < min_date:
-            raise ValueError(
-                f"Дата транзакции слишком старая. Минимальная дата: {min_date.strftime('%Y-%m-%d')}, "
-                f"получено: {v.strftime('%Y-%m-%d')}"
-            )
-        
-        return v
+
+
+class TransactionCategoryUpdate(BaseModel):
+    """Схема для обновления только категории транзакции"""
+    category: str = Field(..., description="Категория транзакции")
 
 
 def validate_numeric_field(value: Optional[Union[str, float, int]], field_name: str, allow_negative: bool = False) -> Optional[float]:

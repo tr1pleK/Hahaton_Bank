@@ -14,7 +14,8 @@ from app.dependencies import get_current_user
 from app.schemas.transaction import (
     TransactionCreate, TransactionUpdate,
     CSVTransactionInput, CSVTransactionPredictionResponse,
-    TransactionFrontendDto, TransactionPredictDto, TransactionDataBaseDto
+    TransactionFrontendDto, TransactionPredictDto, TransactionDataBaseDto,
+    TransactionCategoryUpdate
 )
 from app.services.transaction_service import (
     create_transaction, get_transaction, get_transactions,
@@ -228,18 +229,42 @@ async def get_transaction_endpoint(
 @router.put("/{transaction_id}")
 async def update_transaction_endpoint(
     transaction_id: int,
-    transaction_data: TransactionUpdate,
+    transaction_data: TransactionCategoryUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Обновить транзакцию"""
+    """Обновить категорию транзакции"""
     try:
-        transaction = update_transaction(db, transaction_id, current_user.id, transaction_data)
+        # Получаем транзакцию
+        transaction = get_transaction(db, transaction_id, current_user.id)
         if not transaction:
             raise HTTPException(status_code=404, detail="Транзакция не найдена")
+        
+        # Валидируем и обновляем категорию
+        try:
+            category = TransactionCategory(transaction_data.category)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Неверная категория: {transaction_data.category}"
+            )
+        
+        transaction.category = category
+        db.commit()
+        db.refresh(transaction)
+        
         return to_dict(transaction)
+    except HTTPException:
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка при обновлении транзакции: {str(e)}"
+        )
 
 
 @router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
