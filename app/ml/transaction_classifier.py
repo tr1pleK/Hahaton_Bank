@@ -1,24 +1,32 @@
-"""Классификатор транзакций - использует логику из test_classifier.py"""
-import joblib
+"""Классификатор транзакций на основе LightGBM"""
 import pandas as pd
 import numpy as np
+import joblib
 import os
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from datetime import datetime
 
-from app.models.category import TransactionCategory
 import lightgbm as lgb
 from sklearn.metrics import classification_report, f1_score
 
-# Маппинг категорий модели в категории системы
+from app.models.category import TransactionCategory
+
+# Маппинг категорий из модели в категории системы
 CATEGORY_MAPPING = {
     'Rent': TransactionCategory.UTILITIES,
     'Misc': TransactionCategory.OTHER_EXPENSE,
     'Food': TransactionCategory.PRODUCTS,
     'Salary': TransactionCategory.SALARY,
     'Shopping': TransactionCategory.CLOTHING,
+    'Transport': TransactionCategory.TRANSPORT,
 }
+
+# Обратный маппинг для преобразования категорий системы в категории модели
+REVERSE_CATEGORY_MAPPING = {v: k for k, v in CATEGORY_MAPPING.items()}
+
+# Валидные категории модели
+VALID_CATEGORIES = ["Food", "Misc", "Rent", "Salary", "Shopping"]
 
 
 class TransactionClassifier:
@@ -34,8 +42,8 @@ class TransactionClassifier:
         if model_path:
             self.model_path = model_path
         else:
-            # Путь по умолчанию - модель в папке ml
-            default_path = Path(__file__).parent / "classifier_v2.pkl"
+            # Путь по умолчанию
+            default_path = Path(__file__).parent.parent.parent / "ml_models" / "transaction_classifier.pkl"
             self.model_path = str(default_path)
         
         self.model = None
@@ -51,40 +59,39 @@ class TransactionClassifier:
             print(f"⚠️ Модель не найдена по пути: {self.model_path}")
             print(f"   Используется fallback классификация (вероятность всегда 0.5)")
     
-    def extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Извлечение признаков (логика из test_classifier.py)
+        Извлечение признаков из DataFrame (как в cybergarden_ML.py)
         
         Args:
-            df: DataFrame с колонками Date, Withdrawal, Deposit, Balance
+            df: DataFrame с колонками Date, Category (опционально), Withdrawal, Deposit, Balance
             
         Returns:
             DataFrame с извлеченными признаками
         """
-        # Убеждаемся, что Date является datetime типом
-        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
-            df['Date'] = pd.to_datetime(df['Date'])
-        
         df = df.sort_values("Date").reset_index(drop=True)
+        
+        # Базовые признаки
         df["is_withdrawal"] = (df["Withdrawal"] > 0).astype(int)
         df["is_deposit"] = (df["Deposit"] > 0).astype(int)
         df["amount"] = df["Withdrawal"] + df["Deposit"]
         df["net_flow"] = df["Deposit"] - df["Withdrawal"]
         df["balance_before"] = df["Balance"] + df["Withdrawal"] - df["Deposit"]
-
+        
+        # Признаки даты
         df["day_of_month"] = df["Date"].dt.day
         df["day_of_week"] = df["Date"].dt.dayofweek
         df["is_month_start"] = (df["day_of_month"] <= 10).astype(int)
         df["is_month_end"] = (df["day_of_month"] >= 24).astype(int)
-
-        # Точные бизнес-правила
+        
+        # Бизнес-правила
         df["is_salary_like"] = (df["Deposit"] == 34800).astype(int)
         df["is_rent_like"] = (
             (df["Withdrawal"] >= 3900) & 
             (df["Withdrawal"] <= 7500) & 
             (df["day_of_month"] <= 6)
         ).astype(int)
-
+        
         # Days since last salary
         salary_dates = df[df["Deposit"] == 34800]["Date"].tolist()
         df["days_since_last_salary"] = np.nan
@@ -93,15 +100,24 @@ class TransactionClassifier:
             if past_salaries:
                 last_salary = max(past_salaries)
                 df.at[i, "days_since_last_salary"] = (row["Date"] - last_salary).days
-
+        
         # Days since last transaction
         df["days_since_last_txn"] = df["Date"].diff().dt.days.fillna(0)
-
+        
         return df
     
-    def apply_enhanced_fallback_rules_with_proba(self, X: pd.DataFrame, y_pred_proba: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_feature_columns(self) -> List[str]:
+        """Возвращает список колонок признаков"""
+        return [
+            "is_withdrawal", "is_deposit", "amount", "net_flow", "balance_before",
+            "day_of_month", "day_of_week", "is_month_start", "is_month_end",
+            "is_salary_like", "is_rent_like", "days_since_last_salary", "days_since_last_txn",
+            "Withdrawal", "Deposit"
+        ]
+    
+    def _apply_fallback_rules(self, X: pd.DataFrame, y_pred_proba: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Применение fallback правил (логика из test_classifier.py)
+        Применение fallback правил (как в test_classifier.py)
         
         Args:
             X: DataFrame с признаками
@@ -115,17 +131,22 @@ class TransactionClassifier:
         
         for i in range(len(X)):
             row = X.iloc[i]
-            # Salary: Deposit == 34800 и дата 24–26
+            
+            # Rule 1: Salary - Deposit == 34800 и дата 24–26
             if row["is_salary_like"] == 1 and row["day_of_month"] in [24, 25, 26]:
-                idx = list(categories).index("Salary")
-                y_pred_proba[i] = 0
-                y_pred_proba[i][idx] = 1
-            # Rent: Withdrawal 3900–7500 и дата ≤6
+                if "Salary" in categories:
+                    idx = list(categories).index("Salary")
+                    y_pred_proba[i] = 0
+                    y_pred_proba[i][idx] = 1
+            
+            # Rule 2: Rent - Withdrawal 3900–7500 и дата ≤6
             elif row["is_rent_like"] == 1:
-                idx = list(categories).index("Rent")
-                y_pred_proba[i] = 0
-                y_pred_proba[i][idx] = 1
-            # Shopping: 150–3000 в первые 5 дней после зарплаты
+                if "Rent" in categories:
+                    idx = list(categories).index("Rent")
+                    y_pred_proba[i] = 0
+                    y_pred_proba[i][idx] = 1
+            
+            # Rule 3: Shopping - 150–3000 в первые 5 дней после зарплаты
             elif (
                 row["Withdrawal"] >= 150 and
                 row["Withdrawal"] <= 3000 and
@@ -138,14 +159,155 @@ class TransactionClassifier:
                     y_pred_proba[i] = 0
                     y_pred_proba[i][idx] = 1
         
+        # Получаем предсказания и вероятности
         pred_indices = np.argmax(y_pred_proba, axis=1)
         pred_categories = categories[pred_indices]
         max_probas = np.max(y_pred_proba, axis=1)
+        
         return pred_categories, max_probas
+    
+    def _map_to_transaction_category(self, prediction: str) -> TransactionCategory:
+        """Преобразование предсказания модели в TransactionCategory"""
+        return CATEGORY_MAPPING.get(prediction, TransactionCategory.OTHER_EXPENSE)
+    
+    def train(self, csv_path: str, **kwargs) -> Dict[str, Any]:
+        """
+        Обучение модели на данных из CSV
+        
+        Args:
+            csv_path: Путь к CSV файлу с данными
+            **kwargs: Дополнительные параметры для обучения
+            
+        Returns:
+            Словарь с метриками обучения
+        """
+        # Загрузка данных
+        df = pd.read_csv(csv_path, skiprows=5)
+        df.columns = ["Date1", "Category", "RefNo", "Date2", "Withdrawal", "Deposit", "Balance"]
+        df["Date"] = pd.to_datetime(df["Date2"], format="mixed", errors="coerce")
+        df = df[["Date", "Category", "Withdrawal", "Deposit", "Balance"]].copy()
+        df["Withdrawal"] = pd.to_numeric(df["Withdrawal"], errors="coerce").fillna(0)
+        df["Deposit"] = pd.to_numeric(df["Deposit"], errors="coerce").fillna(0)
+        df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce").fillna(method="ffill")
+        
+        print(f"📊 Загружено {len(df)} записей")
+        
+        # Фильтрация категорий
+        df["Category"] = df["Category"].replace("Transport", "Misc")
+        df = df[df["Category"].isin(VALID_CATEGORIES)].copy().reset_index(drop=True)
+        
+        print(f"📊 После фильтрации: {len(df)} записей")
+        
+        # Извлечение признаков
+        df_features = self._extract_features(df)
+        
+        # Подготовка X и y
+        feature_columns = self._get_feature_columns()
+        X = df_features[feature_columns].fillna(-1)
+        y = df_features["Category"]
+        
+        # Разделение по времени: train до июля, test — июль–декабрь
+        split_date = "2023-07-01"
+        train_idx = df_features[df_features["Date"] < split_date].index
+        test_idx = df_features[df_features["Date"] >= split_date].index
+        
+        X_train = X.loc[train_idx]
+        y_train = y.loc[train_idx]
+        X_test = X.loc[test_idx]
+        y_test = y.loc[test_idx]
+        
+        print(f"📊 Train size: {len(X_train)}, Test size: {len(X_test)}")
+        
+        # Обучение модели
+        self.model = lgb.LGBMClassifier(
+            n_estimators=100,
+            num_leaves=15,
+            learning_rate=0.05,
+            min_data_in_leaf=10,
+            lambda_l1=0.1,
+            lambda_l2=0.1,
+            random_state=42,
+            class_weight="balanced"
+        )
+        
+        print("🚀 Обучение модели...")
+        self.model.fit(X_train, y_train)
+        
+        # Оценка модели
+        y_pred = self.model.predict(X_test)
+        y_pred_proba = self.model.predict_proba(X_test)
+        y_pred_hybrid, _ = self._apply_fallback_rules(X_test, y_pred_proba)
+        
+        # Метрики
+        accuracy = (y_pred_hybrid == y_test).mean()
+        f1_weighted = f1_score(y_test, y_pred_hybrid, average="weighted")
+        
+        print(f"✅ Точность (Accuracy): {accuracy:.4f}")
+        print(f"✅ F1-score (weighted): {f1_weighted:.4f}")
+        
+        self.is_trained = True
+        self.save_model()
+        
+        return {
+            'accuracy': float(accuracy),
+            'f1_weighted': float(f1_weighted),
+            'train_samples': len(X_train),
+            'test_samples': len(X_test),
+            'is_trained': True
+        }
+    
+    def predict(self, description: str, amount: float, is_expense: bool = True, 
+                date: Optional[datetime] = None) -> Tuple[TransactionCategory, float]:
+        """
+        Предсказание категории для одной транзакции
+        
+        Args:
+            description: Описание транзакции (RefNo) - не используется в этой модели
+            amount: Сумма транзакции
+            is_expense: Является ли транзакция расходом
+            date: Дата транзакции
+            
+        Returns:
+            Tuple с категорией и вероятностью
+        """
+        if not self.is_trained or self.model is None:
+            return TransactionCategory.OTHER_EXPENSE, 0.5
+        
+        # Создаем DataFrame для одной транзакции
+        if date is None:
+            date = datetime.now()
+        
+        withdrawal = amount if is_expense else 0.0
+        deposit = amount if not is_expense else 0.0
+        
+        # Для одной транзакции баланс неизвестен, используем 0
+        df = pd.DataFrame([{
+            'Date': date,
+            'Withdrawal': withdrawal,
+            'Deposit': deposit,
+            'Balance': 0.0  # Неизвестен для одной транзакции
+        }])
+        
+        # Извлекаем признаки
+        df_features = self._extract_features(df)
+        
+        # Подготовка признаков
+        feature_columns = self._get_feature_columns()
+        X = df_features[feature_columns].fillna(-1)
+        
+        # Предсказание
+        y_pred_proba = self.model.predict_proba(X)
+        y_pred_hybrid, y_proba_hybrid = self._apply_fallback_rules(X, y_pred_proba)
+        
+        # Преобразование в TransactionCategory
+        category = self._map_to_transaction_category(y_pred_hybrid[0])
+        probability = float(y_proba_hybrid[0])
+        
+        return category, probability
     
     def predict_from_dataframe(self, df: pd.DataFrame) -> Tuple[TransactionCategory, float]:
         """
-        Предсказание категории из DataFrame (логика из test_classifier.py)
+        Предсказание категории из DataFrame (для API endpoint)
         
         Args:
             df: DataFrame с колонками Date, RefNo, Withdrawal, Deposit, Balance
@@ -176,179 +338,31 @@ class TransactionClassifier:
         df_single = df.iloc[[0]].copy()
         
         # Извлекаем признаки
-        df_features = self.extract_features(df_single)
+        df_features = self._extract_features(df_single)
         
         # Подготовка признаков
-        feature_columns = [
-            "is_withdrawal", "is_deposit", "amount", "net_flow", "balance_before",
-            "day_of_month", "day_of_week", "is_month_start", "is_month_end",
-            "is_salary_like", "is_rent_like", "days_since_last_salary", "days_since_last_txn",
-            "Withdrawal", "Deposit"
-        ]
-        
-        X = df_features[feature_columns]
-        X = X.fillna(-1)  # Заполняем NaN
+        feature_columns = self._get_feature_columns()
+        X = df_features[feature_columns].fillna(-1)
         
         # Предсказание
         y_pred_proba = self.model.predict_proba(X)
-        y_pred_hybrid, y_proba_hybrid = self.apply_enhanced_fallback_rules_with_proba(X, y_pred_proba)
+        y_pred_hybrid, y_proba_hybrid = self._apply_fallback_rules(X, y_pred_proba)
         
         # Преобразование в TransactionCategory
-        category_str = y_pred_hybrid[0]
-        category = CATEGORY_MAPPING.get(category_str, TransactionCategory.OTHER_EXPENSE)
+        category = self._map_to_transaction_category(y_pred_hybrid[0])
         probability = float(y_proba_hybrid[0])
         
         return category, probability
     
-    def train(self, df: pd.DataFrame, original_csv_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Обучение модели на DataFrame (логика из cybergarden_ML.py)
-        
-        Args:
-            df: DataFrame с колонками Date, Category, Withdrawal, Deposit, Balance
-            original_csv_path: Путь к оригинальному CSV файлу (опционально, для объединения данных)
-            
-        Returns:
-            Словарь с метриками обучения
-        """
-        print("🚀 Начало обучения модели...")
-        
-        # Если указан оригинальный CSV, объединяем данные
-        if original_csv_path and os.path.exists(original_csv_path):
-            print(f"📂 Загрузка оригинальных данных из {original_csv_path}...")
-            try:
-                df_original = pd.read_csv(original_csv_path, skiprows=5)
-                df_original.columns = ["Date1", "Category", "RefNo", "Date2", "Withdrawal", "Deposit", "Balance"]
-                df_original["Date"] = pd.to_datetime(df_original["Date2"], format="mixed", errors="coerce")
-                df_original = df_original[["Date", "Category", "Withdrawal", "Deposit", "Balance"]].copy()
-                df_original["Withdrawal"] = pd.to_numeric(df_original["Withdrawal"], errors="coerce").fillna(0)
-                df_original["Deposit"] = pd.to_numeric(df_original["Deposit"], errors="coerce").fillna(0)
-                df_original["Balance"] = pd.to_numeric(df_original["Balance"], errors="coerce").fillna(method="ffill")
-                
-                # Объединяем данные
-                df = pd.concat([df_original, df], ignore_index=True)
-                print(f"✅ Объединено данных: {len(df_original)} (оригинал) + {len(df) - len(df_original)} (новые) = {len(df)}")
-            except Exception as e:
-                print(f"⚠️ Не удалось загрузить оригинальный CSV: {e}. Используем только новые данные.")
-        
-        # Убеждаемся, что Date является datetime типом (если еще не преобразовано)
-        if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
-            df['Date'] = pd.to_datetime(df['Date'])
-        
-        # Очистка данных (логика из cybergarden_ML.py)
-        df["Category"] = df["Category"].replace("Transport", "Misc")
-        valid_cats = ["Food", "Misc", "Rent", "Salary", "Shopping"]
-        df = df[df["Category"].isin(valid_cats)].copy().reset_index(drop=True)
-        
-        if len(df) == 0:
-            raise ValueError("Нет данных для обучения после фильтрации категорий")
-        
-        print(f"📊 Данных для обучения: {len(df)}")
-        print(f"📊 Распределение категорий:\n{df['Category'].value_counts()}")
-        
-        # Извлечение признаков
-        df_features = self.extract_features(df)
-        
-        # Подготовка X и y
-        feature_columns = [
-            "is_withdrawal", "is_deposit", "amount", "net_flow", "balance_before",
-            "day_of_month", "day_of_week", "is_month_start", "is_month_end",
-            "is_salary_like", "is_rent_like", "days_since_last_salary", "days_since_last_txn",
-            "Withdrawal", "Deposit"
-        ]
-        
-        X = df_features[feature_columns].fillna(-1)
-        y = df_features["Category"]
-        
-        # Разделение по времени: train до 70% данных, test — остальные 30%
-        split_idx = int(len(df_features) * 0.7)
-        train_idx = df_features.index[:split_idx]
-        test_idx = df_features.index[split_idx:]
-        
-        X_train = X.loc[train_idx]
-        y_train = y.loc[train_idx]
-        X_test = X.loc[test_idx]
-        y_test = y.loc[test_idx]
-        
-        print(f"📊 Train size: {len(X_train)}, Test size: {len(X_test)}")
-        
-        # Обучение модели (логика из cybergarden_ML.py)
-        model = lgb.LGBMClassifier(
-            n_estimators=100,
-            num_leaves=15,
-            learning_rate=0.05,
-            min_data_in_leaf=10,
-            lambda_l1=0.1,
-            lambda_l2=0.1,
-            random_state=42,
-            class_weight="balanced"
-        )
-        
-        print("🎯 Обучение модели...")
-        model.fit(X_train, y_train)
-        
-        # Применение fallback правил
-        def apply_fallback_rules(X, y_pred, categories):
-            y_pred = y_pred.copy()
-            for i in range(len(X)):
-                row = X.iloc[i]
-                if row["is_salary_like"] == 1 and row["day_of_month"] in [24, 25, 26]:
-                    y_pred[i] = "Salary"
-                elif row["is_rent_like"] == 1:
-                    y_pred[i] = "Rent"
-                elif (
-                    row["Withdrawal"] >= 150 and
-                    row["Withdrawal"] <= 3000 and
-                    row["days_since_last_salary"] >= 0 and
-                    row["days_since_last_salary"] <= 5 and
-                    row["is_withdrawal"] == 1
-                ):
-                    y_pred[i] = "Shopping"
-            return y_pred
-        
-        y_pred = model.predict(X_test)
-        y_pred_hybrid = apply_fallback_rules(X_test, y_pred, model.classes_)
-        
-        # Оценка модели
-        f1_weighted = f1_score(y_test, y_pred_hybrid, average="weighted", zero_division=0)
-        f1_macro = f1_score(y_test, y_pred_hybrid, average="macro", zero_division=0)
-        
-        print("\n=== Метрики модели ===")
-        print(classification_report(y_test, y_pred_hybrid, zero_division=0))
-        print(f"F1 (weighted): {f1_weighted:.4f}")
-        print(f"F1 (macro): {f1_macro:.4f}")
-        
-        # Сохранение модели
-        self.model = model
-        self.save_model()
-        self.is_trained = True
-        
-        print(f"✅ Модель обучена и сохранена в: {self.model_path}")
-        
-        return {
-            "f1_weighted": float(f1_weighted),
-            "f1_macro": float(f1_macro),
-            "train_size": len(X_train),
-            "test_size": len(X_test),
-            "total_samples": len(df),
-            "categories": valid_cats
-        }
-    
     def save_model(self):
         """Сохранение модели в файл"""
         if self.model is None:
-            print("❌ Нет модели для сохранения")
+            print("⚠️ Модель не обучена, нечего сохранять")
             return
         
-        try:
-            # Создаем директорию, если её нет
-            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-            joblib.dump(self.model, self.model_path)
-            print(f"✅ Модель сохранена в: {self.model_path}")
-        except Exception as e:
-            print(f"❌ Ошибка при сохранении модели: {e}")
-            import traceback
-            traceback.print_exc()
+        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+        joblib.dump(self.model, self.model_path)
+        print(f"✅ Модель сохранена в: {self.model_path}")
     
     def load_model(self):
         """Загрузка модели из файла"""
