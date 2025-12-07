@@ -108,42 +108,37 @@ async def lifespan(app: FastAPI):
     # Startup
     print("🚀 Запуск приложения...")
     
-    # Инициализация планировщика для дообучения модели
+    # Инициализация планировщика для дообучения модели классификации
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
     from apscheduler.triggers.cron import CronTrigger
-    from app.services.model_retraining import retrain_model
-    from app.database import SessionLocal
+    from app.ml.postlearning_class_ml import weekly_retrain
+    import asyncio
     
     scheduler = AsyncIOScheduler()
     
     async def weekly_retraining():
-        """Еженедельное дообучение модели"""
-        print("🔄 Запуск еженедельного дообучения модели...")
-        db = SessionLocal()
+        """Еженедельное дообучение модели классификации транзакций"""
+        print("🔄 Запуск еженедельного дообучения модели классификации...")
         try:
-            result = retrain_model(db, days_back=7)
-            if result["success"]:
-                print(f"✅ Дообучение завершено успешно. Новых транзакций: {result['new_transactions_count']}")
-            else:
-                print(f"⚠️ Дообучение не выполнено: {result['message']}")
+            # Выполняем в отдельном потоке, чтобы не блокировать event loop
+            await asyncio.get_event_loop().run_in_executor(None, weekly_retrain)
+            print("✅ Дообучение модели классификации завершено")
         except Exception as e:
-            print(f"❌ Ошибка при дообучении модели: {e}")
+            print(f"❌ Ошибка при дообучении модели классификации: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            db.close()
     
-    # Планируем еженедельное дообучение (каждый понедельник в 3:00)
+    # Планируем еженедельное дообучение (каждое воскресенье в 2:00)
     scheduler.add_job(
         weekly_retraining,
-        trigger=CronTrigger(day_of_week='mon', hour=3, minute=0),
-        id='weekly_model_retraining',
-        name='Еженедельное дообучение модели',
+        trigger=CronTrigger(day_of_week='sun', hour=2, minute=0),
+        id='weekly_classification_retraining',
+        name='Еженедельное дообучение модели классификации',
         replace_existing=True
     )
     
     scheduler.start()
-    print("✅ Планировщик задач запущен. Дообучение модели запланировано на каждый понедельник в 3:00")
+    print("✅ Планировщик задач запущен. Дообучение модели классификации запланировано на каждое воскресенье в 2:00")
     
     if not settings.SKIP_DB_CHECK:
         db_connected = wait_for_db()

@@ -8,11 +8,14 @@ from pydantic import ValidationError
 
 from app.database import get_db
 from app.models.user import User
+from app.models.transaction import Transaction
 from app.models.category import TransactionCategory
 from app.dependencies import get_current_user
 from app.schemas.transaction import (
     TransactionCreate, TransactionUpdate,
-    CSVTransactionInput, CSVTransactionPredictionResponse
+    CSVTransactionInput, CSVTransactionPredictionResponse,
+    TransactionFrontendDto, TransactionPredictDto, TransactionDataBaseDto,
+    TransactionCategoryUpdate
 )
 from app.services.transaction_service import (
     create_transaction, get_transaction, get_transactions,
@@ -38,15 +41,108 @@ def to_dict(transaction) -> Dict[str, Any]:
     }
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", status_code=status.HTTP_201_CREATED, response_model=TransactionDataBaseDto)
 async def create_transaction_endpoint(
-    transaction_data: TransactionCreate,
+    transaction_data: TransactionFrontendDto,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """Создать транзакцию"""
-    transaction = create_transaction(db, current_user.id, transaction_data)
-    return to_dict(transaction)
+) -> TransactionDataBaseDto:
+    """
+    Создать транзакцию с автоматическим определением категории через ML модель.
+    
+    Принимает данные с фронтенда (date, isIncome, value) и:
+    1. Преобразует в формат для ML модели
+    2. Получает предсказание категории
+    3. Сохраняет транзакцию в БД
+    4. Возвращает полную информацию о транзакции с категорией
+    """
+    try:
+        # 1. Парсим дату
+        from datetime import datetime as dt
+        transaction_date = dt.strptime(transaction_data.date, '%Y-%m-%d').date()
+        
+        # 2. Получаем текущий баланс пользователя
+        db.refresh(current_user)
+        current_balance = float(current_user.balance)
+        
+        # 3. Рассчитываем баланс после транзакции
+        if transaction_data.isIncome:
+            new_balance = current_balance + transaction_data.value
+            withdrawal = 0.0
+            deposit = transaction_data.value
+        else:
+            new_balance = current_balance - transaction_data.value
+            withdrawal = transaction_data.value
+            deposit = 0.0
+        
+        # 4. Формируем TransactionPredictDto для модели
+        predict_dto = TransactionPredictDto(
+            Date=transaction_data.date,
+            date=transaction_data.date,
+            Ref_num='',
+            Withdrawal=withdrawal,
+            Deposit=deposit,
+            Balance=new_balance
+        )
+        
+        # 5. Создаем DataFrame для модели
+        df = pd.DataFrame([{
+            'Date': transaction_date,
+            'RefNo': predict_dto.Ref_num or '',
+            'Withdrawal': predict_dto.Withdrawal,
+            'Deposit': predict_dto.Deposit,
+            'Balance': predict_dto.Balance
+        }])
+        
+        # 6. Получаем предсказание категории от ML модели
+        classifier = TransactionClassifier()
+        if not classifier.is_trained:
+            # Если модель не загружена, используем дефолтную категорию
+            predicted_category = TransactionCategory.OTHER_EXPENSE
+            probability = 0.5
+        else:
+            predicted_category, probability = classifier.predict_from_dataframe(df)
+        
+        # 7. Создаем транзакцию в БД
+        transaction = Transaction(
+            user_id=current_user.id,
+            amount=transaction_data.value,
+            description=None,
+            date=transaction_date,
+            category=predicted_category
+        )
+        
+        db.add(transaction)
+        
+        # 8. Обновляем баланс пользователя
+        current_user.balance = new_balance
+        
+        db.commit()
+        db.refresh(transaction)
+        db.refresh(current_user)
+        
+        # 9. Формируем ответ TransactionDataBaseDto
+        return TransactionDataBaseDto(
+            id=transaction.id,
+            user_id=transaction.user_id,
+            date=transaction.date.isoformat(),
+            amount=float(transaction.amount),
+            description=transaction.description,
+            category=predicted_category.value,
+            category_probability=round(probability, 4),
+            is_income=transaction.is_income,
+            created_at=transaction.created_at.isoformat() if transaction.created_at else None
+        )
+        
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка при создании транзакции: {str(e)}"
+        )
 
 
 @router.get("")
@@ -133,18 +229,42 @@ async def get_transaction_endpoint(
 @router.put("/{transaction_id}")
 async def update_transaction_endpoint(
     transaction_id: int,
-    transaction_data: TransactionUpdate,
+    transaction_data: TransactionCategoryUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Обновить транзакцию"""
+    """Обновить категорию транзакции"""
     try:
-        transaction = update_transaction(db, transaction_id, current_user.id, transaction_data)
+        # Получаем транзакцию
+        transaction = get_transaction(db, transaction_id, current_user.id)
         if not transaction:
             raise HTTPException(status_code=404, detail="Транзакция не найдена")
+        
+        # Валидируем и обновляем категорию
+        try:
+            category = TransactionCategory(transaction_data.category)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Неверная категория: {transaction_data.category}"
+            )
+        
+        transaction.category = category
+        db.commit()
+        db.refresh(transaction)
+        
         return to_dict(transaction)
+    except HTTPException:
+        raise
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Ошибка при обновлении транзакции: {str(e)}"
+        )
 
 
 @router.delete("/{transaction_id}", status_code=status.HTTP_204_NO_CONTENT)
