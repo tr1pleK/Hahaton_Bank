@@ -30,3 +30,4 @@ async def get_balance_forecast_endpoint(
         raise HTTPException(status_code=500, detail=f"Ошибка при получении прогноза: {str(e)}")
 
 
+

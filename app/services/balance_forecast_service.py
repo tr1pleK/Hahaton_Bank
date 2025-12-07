@@ -115,38 +115,160 @@ def load_transactions_from_db(db: Session, user_id: int) -> pd.DataFrame:
 
 def detect_fixed_events(df: pd.DataFrame) -> tuple:
     """
-    Определение зарплаты и аренды по шаблонам.
+    Определение зарплаты и аренды по шаблонам на основе реальных данных.
+    
+    Минимальные требования для определения паттернов:
+    - Для зарплаты: минимум 2 транзакции с крупными поступлениями (>20000) в период 20-30 числа
+    - Для аренды: минимум 2 транзакции с крупными расходами (>2000) в период 1-10 числа
     
     Returns:
-        tuple: (salary_day, salary_amount, rent_day, rent_amount)
+        tuple: (salary_day, salary_amount, rent_day, rent_amount, salary_detected, rent_detected)
+        где salary_detected и rent_detected - флаги, указывающие, были ли паттерны определены на основе данных
     """
-    if len(df) == 0:
-        return 25, 34800, 1, 6500
+    # Минимальное количество транзакций для надежного определения паттернов
+    MIN_TRANSACTIONS_FOR_PATTERN = 5
+    MIN_SALARY_OCCURRENCES = 2  # Минимум 2 зарплаты для определения паттерна
+    MIN_RENT_OCCURRENCES = 2    # Минимум 2 аренды для определения паттерна
     
-    salary_mask = (df['Deposit'] > 30000) & (df['Date'].dt.day.between(23, 27))
-    salary_day = int(df[salary_mask]['Date'].dt.day.mode().iloc[0]) if not df[salary_mask].empty else 25
-    salary_amount = float(df[salary_mask]['Deposit'].median()) if not df[salary_mask].empty else 34800
-
-    rent_mask = (df['Category'] == 'Rent') | ((df['Withdrawal'] > 3000) & (df['Date'].dt.day <= 6))
-    rent_day = int(df[rent_mask]['Date'].dt.day.mode().iloc[0]) if not df[rent_mask].empty else 1
-    rent_amount = float(df[rent_mask]['Withdrawal'].median()) if not df[rent_mask].empty else 6500
-
-    return salary_day, salary_amount, rent_day, rent_amount
+    # Если данных недостаточно, возвращаем None для неопределенных значений
+    if len(df) < MIN_TRANSACTIONS_FOR_PATTERN:
+        return None, None, None, None, False, False
+    
+    salary_detected = False
+    salary_day = None
+    salary_amount = None
+    
+    # Определение зарплаты: ищем регулярные крупные поступления
+    # Ищем поступления больше 20000 (более гибкий порог)
+    large_deposits = df[df['Deposit'] > 20000].copy()
+    
+    if len(large_deposits) >= MIN_SALARY_OCCURRENCES:
+        # Группируем по дням месяца и ищем наиболее частый день
+        large_deposits['day_of_month'] = large_deposits['Date'].dt.day
+        # Ищем дни в диапазоне 20-30 (типичный период зарплаты)
+        salary_candidates = large_deposits[
+            (large_deposits['day_of_month'] >= 20) & 
+            (large_deposits['day_of_month'] <= 30)
+        ]
+        
+        if len(salary_candidates) >= MIN_SALARY_OCCURRENCES:
+            # Находим наиболее частый день зарплаты
+            day_counts = salary_candidates['day_of_month'].value_counts()
+            if len(day_counts) > 0:
+                salary_day = int(day_counts.index[0])
+                # Берем медиану сумм зарплат для этого дня
+                salary_for_day = salary_candidates[
+                    salary_candidates['day_of_month'] == salary_day
+                ]['Deposit']
+                if len(salary_for_day) > 0:
+                    salary_amount = float(salary_for_day.median())
+                    salary_detected = True
+    
+    # Если не нашли в диапазоне 20-30, пробуем более широкий поиск
+    if not salary_detected and len(large_deposits) >= MIN_SALARY_OCCURRENCES:
+        # Ищем любые регулярные крупные поступления
+        large_deposits['day_of_month'] = large_deposits['Date'].dt.day
+        day_counts = large_deposits['day_of_month'].value_counts()
+        # Ищем день, который встречается минимум MIN_SALARY_OCCURRENCES раз
+        frequent_days = day_counts[day_counts >= MIN_SALARY_OCCURRENCES]
+        if len(frequent_days) > 0:
+            salary_day = int(frequent_days.index[0])
+            salary_for_day = large_deposits[
+                large_deposits['day_of_month'] == salary_day
+            ]['Deposit']
+            if len(salary_for_day) > 0:
+                salary_amount = float(salary_for_day.median())
+                salary_detected = True
+    
+    rent_detected = False
+    rent_day = None
+    rent_amount = None
+    
+    # Определение аренды: ищем регулярные крупные расходы в начале месяца
+    # Вариант 1: Транзакции с категорией Rent
+    rent_by_category = df[df['Category'] == 'Rent'].copy()
+    
+    if len(rent_by_category) >= MIN_RENT_OCCURRENCES:
+        rent_by_category['day_of_month'] = rent_by_category['Date'].dt.day
+        day_counts = rent_by_category['day_of_month'].value_counts()
+        frequent_days = day_counts[day_counts >= MIN_RENT_OCCURRENCES]
+        if len(frequent_days) > 0:
+            rent_day = int(frequent_days.index[0])
+            rent_for_day = rent_by_category[
+                rent_by_category['day_of_month'] == rent_day
+            ]['Withdrawal']
+            if len(rent_for_day) > 0:
+                rent_amount = float(rent_for_day.median())
+                rent_detected = True
+    
+    # Вариант 2: Крупные расходы в начале месяца (1-10 число)
+    if not rent_detected:
+        early_month_large = df[
+            (df['Withdrawal'] > 2000) & 
+            (df['Date'].dt.day >= 1) & 
+            (df['Date'].dt.day <= 10)
+        ].copy()
+        
+        if len(early_month_large) >= MIN_RENT_OCCURRENCES:
+            early_month_large['day_of_month'] = early_month_large['Date'].dt.day
+            day_counts = early_month_large['day_of_month'].value_counts()
+            frequent_days = day_counts[day_counts >= MIN_RENT_OCCURRENCES]
+            if len(frequent_days) > 0:
+                rent_day = int(frequent_days.index[0])
+                rent_for_day = early_month_large[
+                    early_month_large['day_of_month'] == rent_day
+                ]['Withdrawal']
+                if len(rent_for_day) > 0:
+                    rent_amount = float(rent_for_day.median())
+                    rent_detected = True
+    
+    return salary_day, salary_amount, rent_day, rent_amount, salary_detected, rent_detected
 
 
 def compute_spending_stats(df: pd.DataFrame) -> Dict[str, float]:
-    """Вычисление статистики расходов."""
+    """
+    Вычисление статистики расходов.
+    
+    Для новых пользователей (без транзакций) возвращает консервативные значения.
+    """
     if len(df) == 0:
         return {
-            'avg_daily_spending': -500.0,
+            'avg_daily_spending': 0.0,  # Не делаем предположений о расходах
             'avg_daily_income': 0.0,
             'total_misc_withdrawal': 0.0,
             'total_food_withdrawal': 0.0,
         }
     
+    # Убеждаемся, что NetFlow существует (создается в load_transactions_from_db)
+    if 'NetFlow' not in df.columns:
+        df['NetFlow'] = df['Deposit'] - df['Withdrawal']
+    
+    # Исключаем регулярные платежи (Rent, Salary) для расчета переменных расходов
     variable_tx = df[~df['Category'].isin(['Rent', 'Salary'])].copy()
-    avg_daily_spending = float(variable_tx[variable_tx['NetFlow'] < 0]['NetFlow'].mean()) if len(variable_tx[variable_tx['NetFlow'] < 0]) > 0 else -500.0
-    avg_daily_income = float(variable_tx[variable_tx['NetFlow'] > 0]['NetFlow'].mean()) if len(variable_tx[variable_tx['NetFlow'] > 0]) > 0 else 0.0
+    
+    # Средние ежедневные расходы (только если есть данные)
+    spending_tx = variable_tx[variable_tx['NetFlow'] < 0]
+    if len(spending_tx) > 0:
+        # Вычисляем средний расход за день на основе реальных данных
+        spending_tx = spending_tx.copy()
+        spending_tx['days_diff'] = spending_tx['Date'].diff().dt.days.fillna(1)
+        total_spending = abs(spending_tx['NetFlow'].sum())
+        total_days = spending_tx['days_diff'].sum()
+        avg_daily_spending = -float(total_spending / total_days) if total_days > 0 else 0.0
+    else:
+        avg_daily_spending = 0.0
+    
+    # Средние ежедневные доходы (только если есть данные)
+    income_tx = variable_tx[variable_tx['NetFlow'] > 0]
+    if len(income_tx) > 0:
+        income_tx = income_tx.copy()
+        income_tx['days_diff'] = income_tx['Date'].diff().dt.days.fillna(1)
+        total_income = income_tx['NetFlow'].sum()
+        total_days = income_tx['days_diff'].sum()
+        avg_daily_income = float(total_income / total_days) if total_days > 0 else 0.0
+    else:
+        avg_daily_income = 0.0
+    
     total_misc_withdrawal = float(variable_tx[variable_tx['Category'] == 'Misc']['Withdrawal'].sum())
     total_food_withdrawal = float(variable_tx[variable_tx['Category'] == 'Food']['Withdrawal'].sum())
     
@@ -158,15 +280,31 @@ def compute_spending_stats(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
-def assess_budget_stability(salary_amount: float, rent_amount: float, avg_daily_spending: float) -> float:
-    """Оценка устойчивости бюджета."""
+def assess_budget_stability(
+    salary_amount: Optional[float], 
+    rent_amount: Optional[float], 
+    avg_daily_spending: float
+) -> float:
+    """
+    Оценка устойчивости бюджета.
+    
+    Если зарплата или аренда не определены, возвращает 0 (недостаточно данных).
+    """
+    # Если нет данных о зарплате или аренде, не можем оценить устойчивость
+    if salary_amount is None or rent_amount is None:
+        return 0.0
+    
     net_income = salary_amount - rent_amount
     avg_var_spend = -(avg_daily_spending * 30) if avg_daily_spending < 0 else 0.1
     return net_income / avg_var_spend if avg_var_spend > 0 else 0.0
 
 
-def estimate_financial_pillow(df: pd.DataFrame, salary_day: int) -> float:
-    """Оценка финансовой подушки."""
+def estimate_financial_pillow(df: pd.DataFrame, salary_day: Optional[int]) -> float:
+    """
+    Оценка финансовой подушки.
+    
+    Для новых пользователей возвращает 0.0 (недостаточно данных).
+    """
     if len(df) == 0:
         return 0.0
     
@@ -185,7 +323,12 @@ def estimate_financial_pillow(df: pd.DataFrame, salary_day: int) -> float:
     if min_balances:
         return float(pd.Series(min_balances).median())
     else:
-        last_days = df[df['Date'].dt.day >= 25]
+        # Если нет данных о зарплате, используем минимальный баланс за последние дни месяца
+        if salary_day is not None:
+            last_days = df[df['Date'].dt.day >= salary_day - 5]
+        else:
+            last_days = df[df['Date'].dt.day >= 20]
+        
         if not last_days.empty:
             return float(last_days['Balance'].min())
         else:
@@ -195,10 +338,10 @@ def estimate_financial_pillow(df: pd.DataFrame, salary_day: int) -> float:
 def forecast_to_month_end(
     current_date: date,
     current_balance: float,
-    salary_day: int,
-    salary_amount: float,
-    rent_day: int,
-    rent_amount: float,
+    salary_day: Optional[int],
+    salary_amount: Optional[float],
+    rent_day: Optional[int],
+    rent_amount: Optional[float],
     avg_daily_spending: float,
     avg_daily_income: float
 ) -> pd.DataFrame:
@@ -208,10 +351,10 @@ def forecast_to_month_end(
     Args:
         current_date: Текущая дата (вчерашний день)
         current_balance: Текущий баланс
-        salary_day: День зарплаты
-        salary_amount: Сумма зарплаты
-        rent_day: День аренды
-        rent_amount: Сумма аренды
+        salary_day: День зарплаты (None если не определен)
+        salary_amount: Сумма зарплаты (None если не определен)
+        rent_day: День аренды (None если не определен)
+        rent_amount: Сумма аренды (None если не определен)
         avg_daily_spending: Средние ежедневные расходы
         avg_daily_income: Средние ежедневные доходы
         
@@ -227,9 +370,17 @@ def forecast_to_month_end(
     day = current_date + timedelta(days=1)  # Начинаем с сегодняшнего дня
     
     while day <= target_date:
-        # Определяем доходы и расходы на этот день
-        income = salary_amount if day.day == salary_day else max(avg_daily_income, 0)
-        expense = rent_amount if day.day == rent_day else max(-avg_daily_spending, 0)
+        # Определяем доходы на этот день
+        if salary_day is not None and salary_amount is not None and day.day == salary_day:
+            income = salary_amount
+        else:
+            income = max(avg_daily_income, 0)
+        
+        # Определяем расходы на этот день
+        if rent_day is not None and rent_amount is not None and day.day == rent_day:
+            expense = rent_amount
+        else:
+            expense = max(-avg_daily_spending, 0)
         
         balance += income - expense
         
@@ -310,7 +461,7 @@ def get_balance_forecast(db: Session, user_id: int) -> Dict[str, Any]:
         last_balance = current_balance
     
     # Определяем фиксированные события
-    salary_day, salary_amount, rent_day, rent_amount = detect_fixed_events(df)
+    salary_day, salary_amount, rent_day, rent_amount, salary_detected, rent_detected = detect_fixed_events(df)
     
     # Вычисляем статистику расходов
     stats = compute_spending_stats(df)
@@ -342,6 +493,17 @@ def get_balance_forecast(db: Session, user_id: int) -> Dict[str, Any]:
         df
     )
     
+    # Добавляем специальные рекомендации для новых пользователей
+    if not salary_detected or not rent_detected:
+        if len(df) == 0:
+            recommendations.insert(0, "ℹ️ У вас пока нет транзакций. Прогноз будет доступен после добавления нескольких транзакций.")
+        elif len(df) < 5:
+            recommendations.insert(0, "ℹ️ У вас недостаточно транзакций для точного прогноза. Добавьте больше транзакций для улучшения точности.")
+        if not salary_detected:
+            recommendations.append("💡 Система пока не определила день зарплаты. После добавления нескольких крупных поступлений прогноз станет точнее.")
+        if not rent_detected:
+            recommendations.append("💡 Система пока не определила день аренды. После добавления нескольких крупных расходов в начале месяца прогноз станет точнее.")
+    
     # Прогноз на конец месяца
     end_of_month_balance = forecast_df['PredictedBalance'].iloc[-1] if len(forecast_df) > 0 else current_balance
     
@@ -350,10 +512,12 @@ def get_balance_forecast(db: Session, user_id: int) -> Dict[str, Any]:
             'last_date': last_date.strftime('%Y-%m-%d'),
             'last_balance': round(last_balance, 2),
             'current_balance': round(current_balance, 2),
-            'salary_day': salary_day,
-            'salary_amount': round(salary_amount, 2),
-            'rent_day': rent_day,
-            'rent_amount': round(rent_amount, 2),
+            'salary_day': salary_day if salary_detected else None,
+            'salary_amount': round(salary_amount, 2) if salary_amount is not None else None,
+            'salary_detected': salary_detected,
+            'rent_day': rent_day if rent_detected else None,
+            'rent_amount': round(rent_amount, 2) if rent_amount is not None else None,
+            'rent_detected': rent_detected,
             'budget_stability': round(stability, 2),
             'financial_pillow': round(pillow, 2),
             'avg_daily_spending': round(-stats['avg_daily_spending'], 2),
