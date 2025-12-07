@@ -52,9 +52,12 @@ async def create_transaction_endpoint(
     
     Принимает данные с фронтенда (date, isIncome, value) и:
     1. Преобразует в формат для ML модели
-    2. Получает предсказание категории
+    2. Получает предсказание категории (только для расходов, для доходов используется дефолтная категория)
     3. Сохраняет транзакцию в БД
     4. Возвращает полную информацию о транзакции с категорией
+    
+    Важно: Если isIncome = true, категория не предсказывается, используется OTHER_INCOME.
+    Поле isIncome в ответе всегда соответствует значению, указанному пользователем.
     """
     try:
         # 1. Парсим дату
@@ -95,13 +98,21 @@ async def create_transaction_endpoint(
         }])
         
         # 6. Получаем предсказание категории от ML модели
-        classifier = TransactionClassifier()
-        if not classifier.is_trained:
-            # Если модель не загружена, используем дефолтную категорию
-            predicted_category = TransactionCategory.OTHER_EXPENSE
-            probability = 0.5
+        # Если isIncome = true, не предсказываем категорию, используем дефолтную категорию дохода
+        # Если isIncome = false, предсказываем категорию как обычно
+        if transaction_data.isIncome:
+            # Для доходов не предсказываем категорию, используем дефолтную
+            predicted_category = TransactionCategory.OTHER_INCOME
+            probability = 1.0  # 100% уверенность, так как пользователь явно указал доход
         else:
-            predicted_category, probability = classifier.predict_from_dataframe(df)
+            # Для расходов предсказываем категорию через ML модель
+            classifier = TransactionClassifier()
+            if not classifier.is_trained:
+                # Если модель не загружена, используем дефолтную категорию расхода
+                predicted_category = TransactionCategory.OTHER_EXPENSE
+                probability = 0.5
+            else:
+                predicted_category, probability = classifier.predict_from_dataframe(df)
         
         # 7. Создаем транзакцию в БД
         transaction = Transaction(
@@ -122,6 +133,8 @@ async def create_transaction_endpoint(
         db.refresh(current_user)
         
         # 9. Формируем ответ TransactionDataBaseDto
+        # Гарантируем, что is_income соответствует значению, указанному пользователем
+        # (transaction.is_income уже будет правильным, так как мы установили правильную категорию)
         return TransactionDataBaseDto(
             id=transaction.id,
             user_id=transaction.user_id,
@@ -130,7 +143,7 @@ async def create_transaction_endpoint(
             description=transaction.description,
             category=predicted_category.value,
             category_probability=round(probability, 4),
-            is_income=transaction.is_income,
+            is_income=transaction_data.isIncome,  # Используем значение, указанное пользователем
             created_at=transaction.created_at.isoformat() if transaction.created_at else None
         )
         
