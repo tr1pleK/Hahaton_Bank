@@ -61,6 +61,10 @@ class TransactionClassifier:
         Returns:
             DataFrame с извлеченными признаками
         """
+        # Убеждаемся, что Date является datetime типом
+        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+            df['Date'] = pd.to_datetime(df['Date'])
+        
         df = df.sort_values("Date").reset_index(drop=True)
         df["is_withdrawal"] = (df["Withdrawal"] > 0).astype(int)
         df["is_deposit"] = (df["Deposit"] > 0).astype(int)
@@ -226,6 +230,10 @@ class TransactionClassifier:
                 print(f"✅ Объединено данных: {len(df_original)} (оригинал) + {len(df) - len(df_original)} (новые) = {len(df)}")
             except Exception as e:
                 print(f"⚠️ Не удалось загрузить оригинальный CSV: {e}. Используем только новые данные.")
+        
+        # Убеждаемся, что Date является datetime типом (если еще не преобразовано)
+        if 'Date' in df.columns and not pd.api.types.is_datetime64_any_dtype(df['Date']):
+            df['Date'] = pd.to_datetime(df['Date'])
         
         # Очистка данных (логика из cybergarden_ML.py)
         df["Category"] = df["Category"].replace("Transport", "Misc")

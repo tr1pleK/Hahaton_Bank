@@ -30,3 +30,8 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+class BalanceResponse(BaseModel):
+    """Схема ответа с балансом пользователя"""
+    balance: float
+    user_id: int

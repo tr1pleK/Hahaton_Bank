@@ -75,6 +75,10 @@ def export_transactions_to_dataframe(
     
     # Сортируем по дате и вычисляем баланс последовательно
     if len(df) > 0:
+        # Преобразуем Date в datetime, если это еще не сделано
+        if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+            df['Date'] = pd.to_datetime(df['Date'])
+        
         df = df.sort_values("Date").reset_index(drop=True)
         # Вычисляем баланс на основе транзакций (накопительный)
         # Начальный баланс = 0, затем добавляем/вычитаем транзакции
